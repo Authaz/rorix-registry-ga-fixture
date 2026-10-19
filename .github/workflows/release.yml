@@ -1,0 +1,74 @@
+name: Publish Registry GA fixture to NuGet.org
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'Authaz/rorix-registry-ga-fixture' && github.ref == 'refs/tags/v0.1.0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: nuget-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out immutable release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+      - name: Install pinned SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/dotnet/install-scripts/5147e32300a8e908f5d737c8cff63a76b4b63531/src/dotnet-install.sh -o "${RUNNER_TEMP}/dotnet-install.sh"
+          printf '%s  %s\n' '082f7685e156738a1b2e2ed8381a621870d4ce8e8c59278034556f05c186eb2e' "${RUNNER_TEMP}/dotnet-install.sh" | sha256sum -c --strict
+          bash "${RUNNER_TEMP}/dotnet-install.sh" --version 10.0.400 --install-dir "${RUNNER_TEMP}/dotnet"
+          echo "${RUNNER_TEMP}/dotnet" >> "${GITHUB_PATH}"
+          echo "DOTNET_ROOT=${RUNNER_TEMP}/dotnet" >> "${GITHUB_ENV}"
+      - name: Build the exact source package
+        shell: bash
+        run: |
+          set -euo pipefail
+          project=src/Rorix.Registry.GaFixture/Rorix.Registry.GaFixture.csproj
+          test "$(dotnet --version)" = 10.0.400
+          dotnet restore "${project}" --locked-mode -p:NuGetAudit=false
+          dotnet build "${project}" -c Release --no-restore -p:ContinuousIntegrationBuild=true
+          dotnet pack "${project}" -c Release --no-build --output artifacts -p:ContinuousIntegrationBuild=true -p:PackageVersion=0.1.0
+          python3 scripts/check-reproduction.py artifacts/Rorix.Registry.GaFixture.0.1.0.nupkg artifacts/Rorix.Registry.GaFixture.0.1.0.nupkg "${GITHUB_SHA}"
+      - name: Exchange GitHub OIDC token for a temporary NuGet credential
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - name: Publish one fixture package
+        shell: bash
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${NUGET_API_KEY}"
+          dotnet nuget push artifacts/Rorix.Registry.GaFixture.0.1.0.nupkg --api-key "${NUGET_API_KEY}" --source https://api.nuget.org/v3/index.json
+      - name: Verify public package registration
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_url=https://api.nuget.org/v3-flatcontainer/rorix.registry.gafixture/0.1.0/rorix.registry.gafixture.0.1.0.nupkg
+          for attempt in $(seq 1 60); do
+            if curl -fsS "${package_url}" -o "${RUNNER_TEMP}/public.nupkg"; then
+              python3 scripts/check-reproduction.py artifacts/Rorix.Registry.GaFixture.0.1.0.nupkg "${RUNNER_TEMP}/public.nupkg" "${GITHUB_SHA}"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo 'Public fixture was not downloadable within 15 minutes.' >&2
+          exit 1

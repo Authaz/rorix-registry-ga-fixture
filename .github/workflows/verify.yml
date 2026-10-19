@@ -1,0 +1,51 @@
+name: Verify Registry GA fixture
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out first clean source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: source-a
+      - name: Check out second clean source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: source-b
+      - name: Install pinned SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/dotnet/install-scripts/5147e32300a8e908f5d737c8cff63a76b4b63531/src/dotnet-install.sh -o "${RUNNER_TEMP}/dotnet-install.sh"
+          printf '%s  %s\n' '082f7685e156738a1b2e2ed8381a621870d4ce8e8c59278034556f05c186eb2e' "${RUNNER_TEMP}/dotnet-install.sh" | sha256sum -c --strict
+          bash "${RUNNER_TEMP}/dotnet-install.sh" --version 10.0.400 --install-dir "${RUNNER_TEMP}/dotnet"
+          echo "${RUNNER_TEMP}/dotnet" >> "${GITHUB_PATH}"
+          echo "DOTNET_ROOT=${RUNNER_TEMP}/dotnet" >> "${GITHUB_ENV}"
+      - name: Build and pack twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          for source in source-a source-b; do
+            (
+              cd "${source}"
+              export NUGET_PACKAGES="${RUNNER_TEMP}/${source}-packages"
+              project=src/Rorix.Registry.GaFixture/Rorix.Registry.GaFixture.csproj
+              test "$(dotnet --version)" = 10.0.400
+              dotnet restore "${project}" --locked-mode -p:NuGetAudit=false
+              dotnet build "${project}" -c Release --no-restore -p:ContinuousIntegrationBuild=true
+              dotnet pack "${project}" -c Release --no-build --output artifacts -p:ContinuousIntegrationBuild=true -p:PackageVersion=0.1.0
+            )
+          done
+      - name: Compare the admission-significant package contents
+        shell: bash
+        run: python3 source-a/scripts/check-reproduction.py source-a/artifacts/Rorix.Registry.GaFixture.0.1.0.nupkg source-b/artifacts/Rorix.Registry.GaFixture.0.1.0.nupkg "${GITHUB_SHA}"
